@@ -1,0 +1,514 @@
+package renderer
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/go-gl/gl/v3.3-core/gl"
+)
+
+const (
+	// recommended shadow map resolution (tune for quality/performance)
+	shadowWidth  = 2048
+	shadowHeight = 2048
+)
+
+// createDepthShader builds a simple vertex+fragment program that renders depth
+// from the light's point of view. Use this in the first pass to populate a depth texture.
+func createDepthShader() uint32 {
+	const vertexShaderSource = `
+	#version 330 core
+	layout(location = 0) in vec3 aPos;
+	uniform mat4 uModel;
+	uniform mat4 uLightSpace;
+	void main() {
+		gl_Position = uLightSpace * uModel * vec4(aPos, 1.0);
+	}
+	` + "\x00"
+
+	// Fragment shader can be empty for depth-only; keep a minimal fragment shader
+	const fragmentShaderSource = `
+	#version 330 core
+	void main() {
+		// depth is automatically written to the depth buffer
+	}
+	` + "\x00"
+
+	// Compile vertex shader
+	vertexShader := gl.CreateShader(gl.VERTEX_SHADER)
+	csources, free := gl.Strs(vertexShaderSource)
+	gl.ShaderSource(vertexShader, 1, csources, nil)
+	free()
+	gl.CompileShader(vertexShader)
+	checkCompileErrors(vertexShader, "VERTEX (depth)")
+
+	// Compile fragment shader
+	fragmentShader := gl.CreateShader(gl.FRAGMENT_SHADER)
+	csources, free = gl.Strs(fragmentShaderSource)
+	gl.ShaderSource(fragmentShader, 1, csources, nil)
+	free()
+	gl.CompileShader(fragmentShader)
+	checkCompileErrors(fragmentShader, "FRAGMENT (depth)")
+
+	// Link program
+	prog := gl.CreateProgram()
+	gl.AttachShader(prog, vertexShader)
+	gl.AttachShader(prog, fragmentShader)
+	gl.LinkProgram(prog)
+	checkCompileErrors(prog, "PROGRAM (depth)")
+
+	gl.DeleteShader(vertexShader)
+	gl.DeleteShader(fragmentShader)
+
+	return prog
+}
+
+// createSimpleShader builds a shader program that renders the scene and uses a
+// shadow map (sampler2D shadowMap) to compute shadows with basic PCF.
+// --- Simple shader restored to match EndFrame (uses uMVP and vertexColor) ---
+
+func createSimpleShader() uint32 {
+	// vertex shader uses uMVP
+	const vertexShaderSource = `
+	#version 330 core
+	layout(location = 0) in vec3 aPos;
+	layout(location = 1) in vec4 aColor;
+	out vec4 vertexColor;
+	uniform mat4 uMVP;
+	void main() {
+		gl_Position = uMVP * vec4(aPos, 1.0);
+		vertexColor = aColor;
+	}
+	` + "\x00"
+
+	const fragmentShaderSource = `
+	#version 330 core
+	in vec4 vertexColor;
+	out vec4 FragColor;
+	void main() {
+		FragColor = vertexColor;
+	}
+	` + "\x00"
+
+	// Compile vertex shader
+	vertexShader := gl.CreateShader(gl.VERTEX_SHADER)
+	csources, free := gl.Strs(vertexShaderSource)
+	gl.ShaderSource(vertexShader, 1, csources, nil)
+	free()
+	gl.CompileShader(vertexShader)
+	checkCompileErrors(vertexShader, "VERTEX")
+
+	// Compile fragment shader
+	fragmentShader := gl.CreateShader(gl.FRAGMENT_SHADER)
+	csources, free = gl.Strs(fragmentShaderSource)
+	gl.ShaderSource(fragmentShader, 1, csources, nil)
+	free()
+	gl.CompileShader(fragmentShader)
+	checkCompileErrors(fragmentShader, "FRAGMENT")
+
+	// Link shader program
+	shaderProgram := gl.CreateProgram()
+	gl.AttachShader(shaderProgram, vertexShader)
+	gl.AttachShader(shaderProgram, fragmentShader)
+	gl.LinkProgram(shaderProgram)
+	checkCompileErrors(shaderProgram, "PROGRAM")
+
+	gl.DeleteShader(vertexShader)
+	gl.DeleteShader(fragmentShader)
+
+	return shaderProgram
+}
+func createHUDShader() uint32 {
+	// vertex shader uses uMVP
+	const vertexShaderSource = `
+    #version 330 core
+    layout(location = 0) in vec3 aPos;   // x,y,z
+    layout(location = 1) in vec2 aUV;    // u,v
+    layout(location = 2) in vec4 aColor; // vertex color
+    out vec2 vUV;
+    out vec4 vColor;
+    uniform mat4 uProj; // orthographic projection for HUD
+    void main() {
+        gl_Position = uProj * vec4(aPos, 1.0);
+        vUV = aUV;
+        vColor = aColor;
+    }
+
+	` + "\x00"
+
+	const fragmentShaderSource = `
+    #version 330 core
+    in vec2 vUV;
+    in vec4 vColor;
+    uniform sampler2D uTex;
+    out vec4 FragColor;
+    void main() {
+        // sample font atlas (alpha in .r or .a depending on upload)
+        vec4 sampled = texture(uTex, vUV);
+        // multiply color by sampled alpha
+        FragColor = vec4(vColor.rgb, vColor.a * sampled.r);
+        // optionally premultiply or use sampled.a depending on atlas format
+    }
+
+	` + "\x00"
+
+	// Compile vertex shader
+	vertexShader := gl.CreateShader(gl.VERTEX_SHADER)
+	csources, free := gl.Strs(vertexShaderSource)
+	gl.ShaderSource(vertexShader, 1, csources, nil)
+	free()
+	gl.CompileShader(vertexShader)
+	checkCompileErrors(vertexShader, "VERTEX")
+
+	// Compile fragment shader
+	fragmentShader := gl.CreateShader(gl.FRAGMENT_SHADER)
+	csources, free = gl.Strs(fragmentShaderSource)
+	gl.ShaderSource(fragmentShader, 1, csources, nil)
+	free()
+	gl.CompileShader(fragmentShader)
+	checkCompileErrors(fragmentShader, "FRAGMENT")
+
+	// Link shader program
+	shaderProgram := gl.CreateProgram()
+	gl.AttachShader(shaderProgram, vertexShader)
+	gl.AttachShader(shaderProgram, fragmentShader)
+	gl.LinkProgram(shaderProgram)
+	checkCompileErrors(shaderProgram, "PROGRAM")
+
+	gl.DeleteShader(vertexShader)
+	gl.DeleteShader(fragmentShader)
+
+	return shaderProgram
+}
+
+// CreateDepthResources creates a depth texture and framebuffer used for shadow mapping.
+// Returns (depthMapTex, depthFBO). You need to bind and use them when rendering the depth pass.
+func CreateDepthResources() (uint32, uint32) {
+	var depthMap uint32
+	gl.GenTextures(1, &depthMap)
+	gl.BindTexture(gl.TEXTURE_2D, depthMap)
+	// allocate the texture as depth component
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT,
+		shadowWidth, shadowHeight, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.Ptr(nil))
+
+	// set texture parameters: clamp to border and set border color so outside samples are not shadowed
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_BORDER)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_BORDER)
+	borderColor := []float32{1.0, 1.0, 1.0, 1.0}
+	gl.TexParameterfv(gl.TEXTURE_2D, gl.TEXTURE_BORDER_COLOR, &borderColor[0])
+
+	// create framebuffer and attach depth texture
+	var depthFBO uint32
+	gl.GenFramebuffers(1, &depthFBO)
+	gl.BindFramebuffer(gl.FRAMEBUFFER, depthFBO)
+	gl.FramebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthMap, 0)
+	// no color buffer
+	gl.DrawBuffer(gl.NONE)
+	gl.ReadBuffer(gl.NONE)
+	if gl.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
+		panic("Depth framebuffer not complete")
+	}
+	// unbind
+	gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
+	return depthMap, depthFBO
+}
+
+// Utility: set a mat4 uniform (row-major/column-major depends on how you prepare the data).
+// `data` should be a pointer to 16 float32 values in column-major order.
+func setMat4(program uint32, name string, data *[16]float32) {
+	loc := gl.GetUniformLocation(program, gl.Str(name+"\x00"))
+	gl.UniformMatrix4fv(loc, 1, false, &data[0])
+}
+
+// Utility: set vec3 uniform
+func setVec3(program uint32, name string, v [3]float32) {
+	loc := gl.GetUniformLocation(program, gl.Str(name+"\x00"))
+	gl.Uniform3f(loc, v[0], v[1], v[2])
+}
+
+// Utility: set float uniform
+func setFloat(program uint32, name string, val float32) {
+	loc := gl.GetUniformLocation(program, gl.Str(name+"\x00"))
+	gl.Uniform1f(loc, val)
+}
+
+// Example usage (pseudocode / guidance):
+//
+// 1) Create shaders and depth resources at init:
+//    depthShader := createDepthShader()
+//    sceneShader := createSimpleShader()
+//    depthMap, depthFBO := CreateDepthResources()
+//
+// 2) Compute light-space matrix in your CPU code: lightProjection * lightView
+//    (typically an orthographic projection for directional lights; perspective for point/spot lights).
+//
+// 3) First pass (depth-only):
+//    gl.Viewport(0, 0, shadowWidth, shadowHeight)
+//    gl.BindFramebuffer(gl.FRAMEBUFFER, depthFBO)
+//    gl.Clear(gl.DEPTH_BUFFER_BIT)
+//    gl.UseProgram(depthShader)
+//    setMat4(depthShader, "uLightSpace", &lightSpaceMat)  // 4x4 float32 array
+//    for each object {
+//        setMat4(depthShader, "uModel", &modelMat)
+//        bind VAO
+//        gl.DrawElements(...)
+//    }
+//    gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
+//
+// 4) Second pass (scene render):
+//    gl.Viewport(0, 0, screenWidth, screenHeight)
+//    gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+//    gl.UseProgram(sceneShader)
+//    setMat4(sceneShader, "uProjection", &projMat)
+//    setMat4(sceneShader, "uView", &viewMat)
+//    setMat4(sceneShader, "uModel", &modelMat) // per-object
+//    setMat4(sceneShader, "uLightSpace", &lightSpaceMat)
+//    setVec3(sceneShader, "lightPos", [3]float32{lx, ly, lz})
+//    setFloat(sceneShader, "shadowBias", 0.005) // tweak as needed
+//    // bind depth map to texture unit 0
+//    gl.ActiveTexture(gl.TEXTURE0)
+//    gl.BindTexture(gl.TEXTURE_2D, depthMap)
+//    loc := gl.GetUniformLocation(sceneShader, gl.Str("shadowMap\x00"))
+//    gl.Uniform1i(loc, 0)
+//    // draw objects
+//    bind VAO
+//    gl.DrawElements(...)
+//
+// Notes & requirements
+// - Vertex format must now include normals at location 2 (vec3).
+// - You must provide uModel, uView, uProjection (or uMVP) and uLightSpace from your Go CPU code.
+// - For directional lights it's typical to use an orthographic projection for the lightSpace matrix.
+// - Tweak shadow map resolution (shadowWidth/shadowHeight) and shadowBias to control quality and artifacts.
+// - If you want sharper shadows you can reduce PCF kernel or sample fewer texels; for softer shadows increase kernel or perform Gaussian blur on the depth map.
+//
+// The provided helpers (setMat4 / setVec3 / setFloat) are minimal; you may have your own uniform utilities.
+// The above is intentionally self-contained in shader code; it uses a 3x3 PCF and a bias computed from normal-light angle to reduce acne/peter-panning.
+//
+
+func checkCompileErrors(shader uint32, shaderType string) {
+	var success int32
+	if shaderType != "PROGRAM" {
+		gl.GetShaderiv(shader, gl.COMPILE_STATUS, &success)
+		if success == gl.FALSE {
+			var logLength int32
+			gl.GetShaderiv(shader, gl.INFO_LOG_LENGTH, &logLength)
+			log := strings.Repeat("\x00", int(logLength+1))
+			gl.GetShaderInfoLog(shader, logLength, nil, gl.Str(log))
+			panic(fmt.Sprintf("%s SHADER COMPILATION ERROR:\n%s", shaderType, log))
+		}
+	} else {
+		gl.GetProgramiv(shader, gl.LINK_STATUS, &success)
+		if success == gl.FALSE {
+			var logLength int32
+			gl.GetProgramiv(shader, gl.INFO_LOG_LENGTH, &logLength)
+			log := strings.Repeat("\x00", int(logLength+1))
+			gl.GetProgramInfoLog(shader, logLength, nil, gl.Str(log))
+			panic(fmt.Sprintf("PROGRAM LINKING ERROR:\n%s", log))
+		}
+	}
+}
+
+// --- Shadow map debug renderer (renders depth texture into a small screen quad) ---
+
+var (
+	debugQuadVAO      uint32
+	debugQuadVBO      uint32
+	debugQuadShader   uint32
+	shadowDebugInited bool
+)
+
+// createDebugQuadShader builds a simple shader that visualizes a depth texture.
+// If `linearize` uniform is set to 1, it converts non-linear depth to linear using near/far.
+func createDebugQuadShader() uint32 {
+	const vertexShaderSource = `
+	#version 330 core
+	layout(location = 0) in vec2 aPos;
+	layout(location = 1) in vec2 aTexCoord;
+	out vec2 TexCoord;
+	void main() {
+		TexCoord = aTexCoord;
+		gl_Position = vec4(aPos, 0.0, 1.0);
+	}
+	` + "\x00"
+
+	const fragmentShaderSource = `
+	#version 330 core
+	in vec2 TexCoord;
+	out vec4 FragColor;
+	uniform sampler2D depthMap;
+	uniform float near_plane;
+	uniform float far_plane;
+	uniform int linearize; // 0 = show raw depth, 1 = linearize
+
+	// linearize depth stored in the depth buffer (0..1)
+	float LinearizeDepth(float depth) {
+		// convert back to NDC z
+		float z = depth * 2.0 - 1.0;
+		// linear depth in world units
+		float linear = (2.0 * near_plane * far_plane) / (far_plane + near_plane - z * (far_plane - near_plane));
+		// normalize to [0,1] by far plane so visualization fits
+		return linear / far_plane;
+	}
+
+	void main() {
+		float d = texture(depthMap, TexCoord).r;
+		if (linearize == 1) {
+			d = LinearizeDepth(d);
+		}
+		// simple gamma-ish boost for visibility
+		d = pow(d, 0.8);
+		FragColor = vec4(vec3(d), 1.0);
+	}
+	` + "\x00"
+
+	// Compile vertex shader
+	vertexShader := gl.CreateShader(gl.VERTEX_SHADER)
+	csources, free := gl.Strs(vertexShaderSource)
+	gl.ShaderSource(vertexShader, 1, csources, nil)
+	free()
+	gl.CompileShader(vertexShader)
+	checkCompileErrors(vertexShader, "VERTEX (debug)")
+
+	// Compile fragment shader
+	fragmentShader := gl.CreateShader(gl.FRAGMENT_SHADER)
+	csources, free = gl.Strs(fragmentShaderSource)
+	gl.ShaderSource(fragmentShader, 1, csources, nil)
+	free()
+	gl.CompileShader(fragmentShader)
+	checkCompileErrors(fragmentShader, "FRAGMENT (debug)")
+
+	// Link program
+	prog := gl.CreateProgram()
+	gl.AttachShader(prog, vertexShader)
+	gl.AttachShader(prog, fragmentShader)
+	gl.LinkProgram(prog)
+	checkCompileErrors(prog, "PROGRAM (debug)")
+
+	gl.DeleteShader(vertexShader)
+	gl.DeleteShader(fragmentShader)
+
+	return prog
+}
+
+// initShadowDebugResources sets up VAO/VBO and shader for the debug quad.
+// Called lazily on first RenderShadowMapAfterRender call.
+func initShadowDebugResources() {
+	if shadowDebugInited {
+		return
+	}
+
+	debugQuadShader = createDebugQuadShader()
+
+	// Quad in NDC that covers the current viewport. We'll set the viewport
+	// before drawing to limit it to a corner area.
+	// vertex format: pos.x, pos.y, tex.u, tex.v
+	vertices := []float32{
+		// tri 1
+		-1.0, -1.0, 0.0, 0.0,
+		1.0, -1.0, 1.0, 0.0,
+		1.0, 1.0, 1.0, 1.0,
+		// tri 2
+		-1.0, -1.0, 0.0, 0.0,
+		1.0, 1.0, 1.0, 1.0,
+		-1.0, 1.0, 0.0, 1.0,
+	}
+
+	gl.GenVertexArrays(1, &debugQuadVAO)
+	gl.GenBuffers(1, &debugQuadVBO)
+
+	gl.BindVertexArray(debugQuadVAO)
+	gl.BindBuffer(gl.ARRAY_BUFFER, debugQuadVBO)
+	gl.BufferData(gl.ARRAY_BUFFER, 4*len(vertices), gl.Ptr(vertices), gl.STATIC_DRAW)
+
+	// position (vec2)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointer(0, 2, gl.FLOAT, false, int32(4*4), gl.PtrOffset(0))
+	// texcoord (vec2)
+	gl.EnableVertexAttribArray(1)
+	gl.VertexAttribPointer(1, 2, gl.FLOAT, false, int32(4*4), gl.PtrOffset(2*4))
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+
+	shadowDebugInited = true
+}
+
+// btoi helper
+func btoi(b bool) int32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// RenderShadowMapAfterRender draws the supplied depth texture into a small screen quad.
+// Call this AFTER your main render pass (when default framebuffer is bound).
+//
+// Parameters:
+// - depthMap: the depth texture (GL_TEXTURE_2D) that holds the shadow map.
+// - screenWidth, screenHeight: current window size in pixels.
+// - size: the width/height in pixels of the debug quad (square). If <= 0, uses 256.
+// - margin: margin in pixels from the screen edges (e.g. 10).
+// - nearPlane, farPlane: camera near/far used for optional linearization.
+// - linearize: if true, depth will be linearized using near/far for better visualization.
+//
+// Example call (after render):
+//
+//	RenderShadowMapAfterRender(depthMap, screenW, screenH, 256, 10, 0.1, 100.0, true)
+func RenderShadowMapAfterRender(depthMap uint32, screenWidth, screenHeight, size, margin int32, nearPlane, farPlane float32, linearize bool) {
+	if !shadowDebugInited {
+		initShadowDebugResources()
+	}
+
+	if size <= 0 {
+		size = 256
+	}
+
+	// save old viewport
+	var oldViewport [4]int32
+	gl.GetIntegerv(gl.VIEWPORT, &oldViewport[0])
+
+	// place quad at bottom-right by default
+	x := screenWidth - size - margin
+	y := margin
+
+	// ensure inside screen
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+
+	// set viewport to the small area and draw the NDQ quad there
+	gl.Viewport(x, y, size, size)
+
+	// Render the quad; no depth test required
+	gl.Disable(gl.DEPTH_TEST)
+	gl.UseProgram(debugQuadShader)
+
+	// bind depth texture (assumed GL_TEXTURE_2D) to unit 0
+	gl.ActiveTexture(gl.TEXTURE0)
+	gl.BindTexture(gl.TEXTURE_2D, depthMap)
+	loc := gl.GetUniformLocation(debugQuadShader, gl.Str("depthMap\x00"))
+	gl.Uniform1i(loc, 0)
+
+	// set uniforms
+	locNear := gl.GetUniformLocation(debugQuadShader, gl.Str("near_plane\x00"))
+	gl.Uniform1f(locNear, nearPlane)
+	locFar := gl.GetUniformLocation(debugQuadShader, gl.Str("far_plane\x00"))
+	gl.Uniform1f(locFar, farPlane)
+	locLin := gl.GetUniformLocation(debugQuadShader, gl.Str("linearize\x00"))
+	gl.Uniform1i(locLin, btoi(linearize))
+
+	gl.BindVertexArray(debugQuadVAO)
+	gl.DrawArrays(gl.TRIANGLES, 0, 6)
+	gl.BindVertexArray(0)
+
+	// restore state
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+	gl.Enable(gl.DEPTH_TEST)
+	gl.Viewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3])
+}

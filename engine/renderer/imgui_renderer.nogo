@@ -1,0 +1,274 @@
+package renderer
+
+import (
+	"fmt"
+
+	"github.com/go-gl/gl/v4.1-core/gl" // change to your GL version if needed
+	"github.com/go-gl/glfw/v3.3/glfw"
+	"github.com/go-gl/mathgl/mgl32"
+	"github.com/inkyblackness/imgui-go/v4"
+)
+
+type ImGuiRenderer struct {
+	window      *glfw.Window
+	fontTexture uint32
+	vao, vbo    uint32
+	ebo         uint32
+	shader      uint32
+
+	projMtxLoc int32
+}
+
+func NewImGuiRenderer(win *glfw.Window) *ImGuiRenderer {
+	imgui.CreateContext(nil)
+	imgui.CurrentIO().Fonts().AddFontDefault()
+
+	r := &ImGuiRenderer{window: win}
+	r.createDeviceObjects()
+	return r
+}
+
+func compileShader(src string, shaderType uint32) (uint32, error) {
+	shader := gl.CreateShader(shaderType)
+	cs, free := gl.Strs(src + "\x00")
+	gl.ShaderSource(shader, 1, cs, nil)
+	free()
+	gl.CompileShader(shader)
+
+	var status int32
+	gl.GetShaderiv(shader, gl.COMPILE_STATUS, &status)
+	if status == gl.FALSE {
+		var logLen int32
+		gl.GetShaderiv(shader, gl.INFO_LOG_LENGTH, &logLen)
+		log := make([]byte, int(logLen)+1)
+		gl.GetShaderInfoLog(shader, logLen, nil, &log[0])
+		return 0, fmt.Errorf("shader compile error: %s", string(log))
+	}
+	return shader, nil
+}
+
+func linkProgram(vs, fs uint32) (uint32, error) {
+	prog := gl.CreateProgram()
+	gl.AttachShader(prog, vs)
+	gl.AttachShader(prog, fs)
+	gl.LinkProgram(prog)
+
+	var status int32
+	gl.GetProgramiv(prog, gl.LINK_STATUS, &status)
+	if status == gl.FALSE {
+		var logLen int32
+		gl.GetProgramiv(prog, gl.INFO_LOG_LENGTH, &logLen)
+		log := make([]byte, int(logLen)+1)
+		gl.GetProgramInfoLog(prog, logLen, nil, &log[0])
+		return 0, fmt.Errorf("program link error: %s", string(log))
+	}
+	// shaders can be deleted after link
+	gl.DeleteShader(vs)
+	gl.DeleteShader(fs)
+	return prog, nil
+}
+
+func (r *ImGuiRenderer) createDeviceObjects() {
+	// Simple shader (adjust #version for your GL)
+	vs := `#version 330 core
+layout (location = 0) in vec2 Position;
+layout (location = 1) in vec2 UV;
+layout (location = 2) in vec4 Color;
+uniform mat4 ProjMtx;
+out vec2 Frag_UV;
+out vec4 Frag_Color;
+void main() {
+    Frag_UV = UV;
+    Frag_Color = Color;
+    gl_Position = ProjMtx * vec4(Position.xy, 0.0, 1.0);
+}`
+	fs := `#version 330 core
+in vec2 Frag_UV;
+in vec4 Frag_Color;
+uniform sampler2D Texture;
+out vec4 Out_Color;
+void main() {
+    Out_Color = Frag_Color * texture(Texture, Frag_UV);
+}`
+
+	vsId, err := compileShader(vs, gl.VERTEX_SHADER)
+	if err != nil {
+		panic(err)
+	}
+	fsId, err := compileShader(fs, gl.FRAGMENT_SHADER)
+	if err != nil {
+		panic(err)
+	}
+	prog, err := linkProgram(vsId, fsId)
+	if err != nil {
+		panic(err)
+	}
+	r.shader = prog
+	r.projMtxLoc = gl.GetUniformLocation(r.shader, gl.Str("ProjMtx\x00"))
+
+	// Create VAO/VBO/EBO
+	gl.GenVertexArrays(1, &r.vao)
+	gl.GenBuffers(1, &r.vbo)
+	gl.GenBuffers(1, &r.ebo)
+
+	gl.BindVertexArray(r.vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.ebo)
+
+	// ImDrawVert: pos(2 float) + uv(2 float) + col(4 u8) -> stride = 20 bytes
+	stride := int32(20)
+
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointer(0, 2, gl.FLOAT, false, stride, gl.PtrOffset(0))
+	gl.EnableVertexAttribArray(1)
+	gl.VertexAttribPointer(1, 2, gl.FLOAT, false, stride, gl.PtrOffset(2*4))
+	gl.EnableVertexAttribArray(2)
+	gl.VertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, stride, gl.PtrOffset(4*4))
+
+	gl.BindVertexArray(0)
+
+	// Upload font atlas
+	atlas := imgui.CurrentIO().Fonts() // FontAtlas (value)
+	// Try RGBA32 image first
+	if rgba := atlas.TextureDataRGBA32(); rgba != nil {
+		w := int(rgba.Width)
+		h := int(rgba.Height)
+		ptr := rgba.Pixels
+		gl.GenTextures(1, &r.fontTexture)
+		gl.BindTexture(gl.TEXTURE_2D, r.fontTexture)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+		gl.PixelStorei(gl.UNPACK_ROW_LENGTH, 0)
+		// Pixels is an unsafe.Pointer to RGBA bytes
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, int32(w), int32(h), 0, gl.RGBA, gl.UNSIGNED_BYTE, ptr)
+		atlas.SetTextureID(imgui.TextureID(uintptr(r.fontTexture)))
+	} else if a := atlas.TextureDataAlpha8(); a != nil {
+		w := int(a.Width)
+		h := int(a.Height)
+		ptr := a.Pixels
+		gl.GenTextures(1, &r.fontTexture)
+		gl.BindTexture(gl.TEXTURE_2D, r.fontTexture)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+		gl.PixelStorei(gl.UNPACK_ROW_LENGTH, 0)
+		// upload as RED (single channel)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RED, int32(w), int32(h), 0, gl.RED, gl.UNSIGNED_BYTE, ptr)
+		atlas.SetTextureID(imgui.TextureID(uintptr(r.fontTexture)))
+	} else {
+		// no atlas data available (fonts may not be built)
+	}
+
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+}
+
+func (r *ImGuiRenderer) RenderImGui() {
+	drawData := imgui.RenderedDrawData()
+	if !drawData.Valid() {
+		return
+	}
+
+	// framebuffer size (two-value)
+	w, h := r.window.GetFramebufferSize()
+	fbWidth := int32(w)
+	fbHeight := int32(h)
+	if fbWidth == 0 || fbHeight == 0 {
+		return
+	}
+
+	gl.Viewport(0, 0, fbWidth, fbHeight)
+	gl.Enable(gl.BLEND)
+	gl.BlendEquation(gl.FUNC_ADD)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	gl.Disable(gl.CULL_FACE)
+	gl.Disable(gl.DEPTH_TEST)
+	gl.Enable(gl.SCISSOR_TEST)
+
+	// Use program and set projection
+	gl.UseProgram(r.shader)
+	proj := mgl32.Ortho2D(0, float32(fbWidth), float32(fbHeight), 0) // flip Y so 0 is top
+	gl.UniformMatrix4fv(r.projMtxLoc, 1, false, &proj[0])
+
+	// Bind VAO
+	gl.BindVertexArray(r.vao)
+
+	// Per-list upload and per-command draw
+	for _, cmdList := range drawData.CommandLists() {
+		vtxPtr, vtxBytes := cmdList.VertexBuffer() // (unsafe.Pointer, int) -> bytes
+		idxPtr, idxBytes := cmdList.IndexBuffer()  // (unsafe.Pointer, int) -> bytes
+
+		// Upload vertex buffer (vtxBytes is already the total byte size)
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+		if vtxBytes > 0 {
+			gl.BufferData(gl.ARRAY_BUFFER, vtxBytes, vtxPtr, gl.STREAM_DRAW)
+		} else {
+			gl.BufferData(gl.ARRAY_BUFFER, 0, nil, gl.STREAM_DRAW)
+		}
+
+		// Upload index buffer
+		gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.ebo)
+		if idxBytes > 0 {
+			gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, idxBytes, idxPtr, gl.STREAM_DRAW)
+		} else {
+			gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 0, nil, gl.STREAM_DRAW)
+		}
+
+		// Index entry size (bytes per index: 2 or 4)
+		idxEntrySize := imgui.IndexBufferLayout()
+
+		for _, cmd := range cmdList.Commands() {
+			if cmd.HasUserCallback() {
+				cmd.CallUserCallback(cmdList)
+			} else {
+				// ClipRect is Vec4(X,Y,Z,W) = x1,y1,x2,y2 in display coords
+				clip := cmd.ClipRect()
+				// apply display pos and framebuffer scale (recommended)
+				dp := drawData.DisplayPos()
+				scale := drawData.FrameBufferScale()
+
+				// convert to framebuffer (integer) coordinates
+				x := int((clip.X-dp.X)*scale.X + 0.5)
+				y := int((clip.Y-dp.Y)*scale.Y + 0.5)
+				x2 := int((clip.Z-dp.X)*scale.X + 0.5)
+				y2 := int((clip.W-dp.Y)*scale.Y + 0.5)
+
+				// clamp to framebuffer
+				if x < 0 {
+					x = 0
+				}
+				if y < 0 {
+					y = 0
+				}
+				if x2 > int(fbWidth) {
+					x2 = int(fbWidth)
+				}
+				if y2 > int(fbHeight) {
+					y2 = int(fbHeight)
+				}
+				gl.Scissor(int32(x), int32(y), int32(x2-x), int32(y2-y))
+
+				// bind texture (TextureID is a imgui.TextureID - we stored GLuint earlier)
+				tex := cmd.TextureID()
+				if tex != 0 {
+					gl.BindTexture(gl.TEXTURE_2D, uint32(uintptr(tex)))
+				} else {
+					gl.BindTexture(gl.TEXTURE_2D, r.fontTexture)
+				}
+
+				// Draw: ElementCount indices starting at IndexOffset (IndexOffset counts indices, not bytes)
+				count := cmd.ElementCount()
+				indexOffset := cmd.IndexOffset() * idxEntrySize // bytes offset
+				if idxEntrySize == 2 {
+					gl.DrawElements(gl.TRIANGLES, int32(count), gl.UNSIGNED_SHORT, gl.PtrOffset(indexOffset))
+				} else {
+					gl.DrawElements(gl.TRIANGLES, int32(count), gl.UNSIGNED_INT, gl.PtrOffset(indexOffset))
+				}
+			}
+		}
+	}
+
+	// cleanup
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+	gl.Disable(gl.SCISSOR_TEST)
+	gl.Disable(gl.BLEND)
+}

@@ -1,0 +1,153 @@
+package main
+
+import (
+	"log"
+	"math"
+	"runtime"
+
+	"github.com/bloxown/bo3-client/engine/camera"
+	"github.com/bloxown/bo3-client/engine/renderer"
+	"github.com/go-gl/glfw/v3.3/glfw"
+	"github.com/go-gl/mathgl/mgl32"
+)
+
+const (
+	width  = 800
+	height = 600
+)
+
+func init() {
+	// GLFW & OpenGL must be driven from the main OS thread
+	runtime.LockOSThread()
+}
+
+func main() {
+	// Init GLFW (window hints may be required by renderer.NewRenderer too)
+	if err := glfw.Init(); err != nil {
+		log.Fatalln("failed to initialize glfw:", err)
+	}
+	defer glfw.Terminate()
+
+	// Optionally set hints here if your renderer expects them before creating the window
+	glfw.WindowHint(glfw.ContextVersionMajor, 3)
+	glfw.WindowHint(glfw.ContextVersionMinor, 3)
+	glfw.WindowHint(glfw.Resizable, glfw.True)
+
+	// Create renderer (expects ints)
+	rend := renderer.NewRenderer(width, height, "BO3 Go (Go)")
+	defer rend.Destroy() // if you implemented cleanup
+
+	// Create renderer for imgui
+	//imguiRend := renderer.NewImGuiRenderer(glfw.GetCurrentContext())
+
+	// Create camera
+	cam := camera.NewCamera(mgl32.Vec3{0, 0, 3}, mgl32.Vec3{0, 1, 0}, -90.0, 0.0)
+
+	// Mouse tracking
+	var lastX, lastY float64
+	firstMouse := true
+
+	// Timing
+	lastTime := float32(glfw.GetTime())
+
+	for !rend.ShouldClose() {
+		// Delta time
+		currentTime := float32(glfw.GetTime())
+		dt := currentTime - lastTime
+		if dt <= 0 {
+			dt = 0.0001
+		}
+		lastTime = currentTime
+
+		// Poll OS events
+		glfw.PollEvents()
+
+		// Get the current GLFW window (renderer made the context current)
+		win := glfw.GetCurrentContext()
+		if win == nil {
+			log.Println("no current GLFW context; renderer should MakeContextCurrent()")
+			break
+		}
+
+		// Keyboard input (WASD)
+		forward := win.GetKey(glfw.KeyW) == glfw.Press
+		backward := win.GetKey(glfw.KeyS) == glfw.Press
+		left := win.GetKey(glfw.KeyA) == glfw.Press
+		right := win.GetKey(glfw.KeyD) == glfw.Press
+		cam.ProcessKeyboard(forward, backward, left, right, dt)
+
+		// Mouse input (relative motion)
+		xpos, ypos := win.GetCursorPos()
+		if firstMouse {
+			lastX = xpos
+			lastY = ypos
+			firstMouse = false
+		}
+		dx := float32(xpos - lastX)
+		dy := float32(ypos - lastY)
+		lastX = xpos
+		lastY = ypos
+		if dx != 0 || dy != 0 {
+			cam.ProcessMouse(dx, dy)
+		}
+
+		// Start frame
+		rend.BeginFrame()
+
+		// Example: push a single rotating cube that uses the camera
+		angle := float32((math.Sin(float64(currentTime))*0.5 + 0.5) * math.Pi) // just a varying angle
+		rot := mgl32.QuatRotate(angle, mgl32.Vec3{0, 1, 0})
+
+		rend.PushPrimitiveBlock(
+			mgl32.Vec3{0, 10, -5},  // position
+			mgl32.Vec3{1, 1, 1},    // size
+			rot,                    // rotation quaternion
+			mgl32.Vec4{1, 0, 0, 1}, // color (red)
+			"LightCube",            // type
+		)
+
+		rend.PushPrimitiveBlock(
+			mgl32.Vec3{0, -5, -5},                    // position
+			mgl32.Vec3{100, 1, 100},                  // size (large floor)
+			mgl32.Quat{W: 1, V: mgl32.Vec3{0, 0, 0}}, // identity quaternion - no rotation
+			mgl32.Vec4{0, 1, 0, 1},                   // color
+			"cube",
+		)
+
+		rend.PushUIText(
+			mgl32.Vec3{0, -5, -5}, // position
+			mgl32.Vec4{0, 1, 0, 1},
+			"aaa",
+		)
+
+		// Example: spawn a 3x3x3 grid of cubes
+		for x := -1; x <= 1; x++ {
+			for y := -1; y <= 1; y++ {
+				for z := -1; z <= 1; z++ {
+					pos := mgl32.Vec3{float32(x) * 2, float32(y) * 2, float32(z)*2 - 5} // offset from camera
+					size := mgl32.Vec3{1, 1, 1}
+					rot := mgl32.QuatRotate(float32(glfw.GetTime()), mgl32.Vec3{0, 1, 0}) // rotating
+					color := mgl32.Vec4{float32(x+1) / 2, float32(y+1) / 2, float32(z+1) / 2, 1}
+
+					rend.PushPrimitiveBlock(pos, size, rot, color, "cube")
+				}
+			}
+		}
+
+		// End frame / draw / present
+		view := cam.GetViewMatrix()       // returns mgl32.Mat4
+		proj := cam.GetProjectionMatrix() // returns mgl32.Mat4
+		rend.EndFrame(view, proj)
+
+		// RENDER DEV UI
+		/*imgui.NewFrame()
+		imgui.Begin("Hello")
+		imgui.Text("ImGui running in Go!")
+		imgui.End()
+		imgui.Render()
+		imguiRend.RenderImGui()*/ // draws ImGui on top
+
+		// Cap FPS a bit (optional)
+		//time.Sleep(16 * time.Millisecond)
+	}
+}

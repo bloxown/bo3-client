@@ -1,0 +1,297 @@
+package renderer
+
+import (
+	"log"
+	"runtime"
+
+	"github.com/go-gl/gl/v3.3-core/gl"
+	"github.com/go-gl/glfw/v3.3/glfw"
+	"github.com/go-gl/mathgl/mgl32"
+)
+
+type Renderer struct {
+	window  *glfw.Window
+	queue   []Primitive
+	uiqueue []UIElement
+	width   int
+	height  int
+	vao     uint32
+	vbo     uint32
+	shader  uint32
+	shader2 uint32
+}
+
+type Primitive struct {
+	Position mgl32.Vec3
+	Size     mgl32.Vec3
+	Rotation mgl32.Quat
+	Color    mgl32.Vec4
+	Type     string
+}
+
+type UIElement struct {
+	Position mgl32.Vec3
+	Size     mgl32.Vec3
+	Rotation mgl32.Quat
+	Color    mgl32.Vec4
+	Content  string
+	Type     string
+}
+
+func init() {
+	// GLFW + OpenGL need to run on main thread
+	runtime.LockOSThread()
+}
+
+func NewRenderer(width, height int, title string) *Renderer {
+	if err := glfw.Init(); err != nil {
+		log.Fatalln("failed to init glfw:", err)
+	}
+
+	glfw.WindowHint(glfw.ContextVersionMajor, 3)
+	glfw.WindowHint(glfw.ContextVersionMinor, 3)
+	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
+	glfw.WindowHint(glfw.Resizable, glfw.True)
+
+	window, err := glfw.CreateWindow(width, height, title, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	window.MakeContextCurrent()
+
+	if err := gl.Init(); err != nil {
+		panic(err)
+	}
+
+	gl.Viewport(0, 0, int32(width), int32(height))
+	gl.ClearColor(0.2, 0.1, 0.1, 1.0)
+	gl.Enable(gl.DEPTH_TEST)
+	gl.DepthFunc(gl.LESS)
+
+	return &Renderer{
+		window:  window,
+		width:   width,
+		height:  height,
+		queue:   []Primitive{},
+		uiqueue: []UIElement{},
+	}
+}
+
+func (r *Renderer) ShouldClose() bool {
+	return r.window.ShouldClose()
+}
+
+func (r *Renderer) BeginFrame() {
+	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+	r.queue = r.queue[:0] // clear queue
+	r.uiqueue = r.uiqueue[:0]
+	gl.GenVertexArrays(1, &r.vao)
+	gl.GenBuffers(1, &r.vbo)
+	r.shader = createSimpleShader() // your shader creation function
+	r.shader2 = createHUDShader()
+}
+
+func (r *Renderer) PushPrimitiveBlock(pos, size mgl32.Vec3, rot mgl32.Quat, color mgl32.Vec4, typetheCube string) {
+	r.queue = append(r.queue, Primitive{
+		Position: pos,
+		Size:     size,
+		Rotation: rot,
+		Color:    color,
+		Type:     typetheCube,
+	})
+}
+
+func (r *Renderer) PushUIText(pos mgl32.Vec3, color mgl32.Vec4, content string) {
+	r.uiqueue = append(r.uiqueue, UIElement{
+		Position: pos,
+		Size:     mgl32.Vec3{0, 0, 0}, // size can be ignored for text
+		Rotation: mgl32.QuatIdent(),   // no rotation by default
+		Color:    color,
+		Content:  content,
+		Type:     "text",
+	})
+}
+
+// --- helper to convert cube to 36 vertices ---
+func cubeToVerticesObject(pos, size mgl32.Vec3, rot mgl32.Quat, color mgl32.Vec4) []float32 {
+	// cube corners in local/object space (centered at origin, half-size 0.5)
+	corners := []mgl32.Vec3{
+		{-0.5, -0.5, -0.5}, {0.5, -0.5, -0.5},
+		{0.5, 0.5, -0.5}, {-0.5, 0.5, -0.5},
+		{-0.5, -0.5, 0.5}, {0.5, -0.5, 0.5},
+		{0.5, 0.5, 0.5}, {-0.5, 0.5, 0.5},
+	}
+
+	// We will use model matrix in shader, so vertices stay in object space (no transform here).
+	idx := []int{
+		0, 1, 2, 2, 3, 0, // back
+		4, 5, 6, 6, 7, 4, // front
+		0, 4, 7, 7, 3, 0, // left
+		1, 5, 6, 6, 2, 1, // right
+		3, 2, 6, 6, 7, 3, // top
+		0, 1, 5, 5, 4, 0, // bottom
+	}
+
+	verts := make([]float32, 0, len(idx)*7)
+	for _, i := range idx {
+		c := corners[i]
+		// object-space position scaled by 1 (we leave scale to model matrix in shader)
+		verts = append(verts, c[0], c[1], c[2])
+		verts = append(verts, color[0], color[1], color[2], color[3])
+	}
+	return verts
+}
+
+func (r *Renderer) EndFrame(view, proj mgl32.Mat4) {
+	// Clear once
+	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+	// --------- Render 3D primitives ---------
+	var vertices []float32
+	type rangeInfo struct{ start, count int32 }
+	ranges := make([]rangeInfo, 0, len(r.queue))
+
+	for _, prim := range r.queue {
+		verts := cubeToVerticesObject(prim.Position, prim.Size, prim.Rotation, prim.Color)
+		start := int32(len(vertices) / 7)
+		vertices = append(vertices, verts...)
+		count := int32(len(verts) / 7)
+		ranges = append(ranges, rangeInfo{start: start, count: count})
+	}
+
+	if len(vertices) > 0 {
+		gl.BindVertexArray(r.vao)
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+		gl.BufferData(gl.ARRAY_BUFFER, len(vertices)*4, gl.Ptr(vertices), gl.DYNAMIC_DRAW)
+
+		gl.UseProgram(r.shader)
+		stride := int32(7 * 4)
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointer(0, 3, gl.FLOAT, false, stride, gl.PtrOffset(0))
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointer(1, 4, gl.FLOAT, false, stride, gl.PtrOffset(3*4))
+
+		uMVPLoc := gl.GetUniformLocation(r.shader, gl.Str("uMVP\x00"))
+
+		for i, prim := range r.queue {
+			rotMat := prim.Rotation.Mat4()
+			scaleMat := mgl32.Scale3D(prim.Size[0], prim.Size[1], prim.Size[2])
+			transMat := mgl32.Translate3D(prim.Position[0], prim.Position[1], prim.Position[2])
+			model := transMat.Mul4(rotMat).Mul4(scaleMat)
+			mvp := proj.Mul4(view.Mul4(model))
+			gl.UniformMatrix4fv(uMVPLoc, 1, false, &mvp[0])
+
+			start := ranges[i].start
+			count := ranges[i].count
+			gl.DrawArrays(gl.TRIANGLES, start, count)
+		}
+
+		gl.DisableVertexAttribArray(0)
+		gl.DisableVertexAttribArray(1)
+		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+		gl.BindVertexArray(0)
+	}
+
+	// --------- Render UI elements ---------
+	if len(r.uiqueue) > 0 {
+		gl.UseProgram(r.shader2) // switch to UI shader
+		ortho := mgl32.Ortho2D(0, float32(r.width), 0, float32(r.height))
+
+		for _, ui := range r.uiqueue {
+			switch ui.Type {
+			case "text":
+				RenderText(ui.Content, ui.Position.X(), ui.Position.Y(), ui.Color, ortho, ui.Position.Z())
+			// case "image": render image quads here
+			default:
+				// ignore unsupported types
+			}
+		}
+	}
+
+	// Present
+	r.window.SwapBuffers()
+	glfw.PollEvents()
+
+	// Clear queues for next frame
+	r.queue = r.queue[:0]
+	r.uiqueue = r.uiqueue[:0]
+}
+
+/*func (r *Renderer) EndFrame(view, proj mgl32.Mat4) {
+	// Clear once
+	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+	// Build a single big vertex buffer and track per-primitive ranges
+	var vertices []float32
+	type rangeInfo struct{ start, count int32 } // start in vertices (not bytes) / count in vertices
+	ranges := make([]rangeInfo, 0, len(r.queue))
+
+	for _, prim := range r.queue {
+		verts := cubeToVerticesObject(prim.Position, prim.Size, prim.Rotation, prim.Color) // 7 floats/vertex
+		start := int32(len(vertices) / 7)                                                  // number of vertices already in buffer
+		vertices = append(vertices, verts...)
+		count := int32(len(verts) / 7)
+		ranges = append(ranges, rangeInfo{start: start, count: count})
+	}
+
+	if len(vertices) == 0 {
+		// nothing to draw
+		r.window.SwapBuffers()
+		glfw.PollEvents()
+		return
+	}
+
+	// Upload the entire buffer once
+	gl.BindVertexArray(r.vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+	gl.BufferData(gl.ARRAY_BUFFER, len(vertices)*4, gl.Ptr(vertices), gl.DYNAMIC_DRAW)
+
+	// Setup shader and attribute pointers once
+	gl.UseProgram(r.shader)
+
+	// attribute layout: location 0 = vec3 pos, location 1 = vec4 color
+	stride := int32(7 * 4)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointer(0, 3, gl.FLOAT, false, stride, gl.PtrOffset(0))
+	gl.EnableVertexAttribArray(1)
+	gl.VertexAttribPointer(1, 4, gl.FLOAT, false, stride, gl.PtrOffset(3*4))
+
+	// Uniform location (cache it elsewhere for perf)
+	uMVPLoc := gl.GetUniformLocation(r.shader, gl.Str("uMVP\x00"))
+
+	// Draw per-primitive with appropriate MVP
+	for i, prim := range r.queue {
+		// Model matrix: T * R * S
+		rotMat := prim.Rotation.Mat4()
+		scaleMat := mgl32.Scale3D(prim.Size[0], prim.Size[1], prim.Size[2])
+		transMat := mgl32.Translate3D(prim.Position[0], prim.Position[1], prim.Position[2])
+		model := transMat.Mul4(rotMat).Mul4(scaleMat)
+		mvp := proj.Mul4(view.Mul4(model))
+
+		// Upload uniform (use gl.Ptr for safety)
+		gl.UniformMatrix4fv(uMVPLoc, 1, false, &mvp[:][0]) //gl.UniformMatrix4fv(uMVPLoc, 1, false, gl.Ptr(&mvp[0]))
+
+		// Draw the primitive's vertex range
+		start := ranges[i].start
+		count := ranges[i].count
+		gl.DrawArrays(gl.TRIANGLES, start, count)
+	}
+
+	// cleanup
+	gl.DisableVertexAttribArray(0)
+	gl.DisableVertexAttribArray(1)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+
+	// present
+	r.window.SwapBuffers()
+	glfw.PollEvents()
+
+	// clear queue for next frame
+	r.queue = r.queue[:0]
+}*/
+
+func (r *Renderer) Destroy() {
+	r.window.Destroy()
+	glfw.Terminate()
+}

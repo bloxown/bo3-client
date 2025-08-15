@@ -1,0 +1,68 @@
+package renderer
+
+import (
+	"github.com/go-gl/gl/v3.3-core/gl"
+	"github.com/go-gl/mathgl/mgl32"
+)
+
+type Glyph struct {
+	TexCoords [4]float32 // u0,v0,u1,v1
+	Size      mgl32.Vec2
+	Bearing   mgl32.Vec2
+	Advance   float32
+}
+
+// Assume you have a map of characters to glyphs:
+var FontAtlas map[rune]Glyph
+var FontTexture uint32
+var FontShader uint32
+var FontVAO, FontVBO uint32
+
+func RenderText(content string, x, y float32, color mgl32.Vec4, ortho mgl32.Mat4, z float32) {
+	gl.UseProgram(FontShader)
+	gl.UniformMatrix4fv(gl.GetUniformLocation(FontShader, gl.Str("uProjection\x00")), 1, false, &ortho[0])
+	gl.Uniform4fv(gl.GetUniformLocation(FontShader, gl.Str("uColor\x00")), 1, &color[0])
+
+	gl.ActiveTexture(gl.TEXTURE0)
+	gl.BindTexture(gl.TEXTURE_2D, FontTexture)
+
+	gl.BindVertexArray(FontVAO)
+	gl.BindBuffer(gl.ARRAY_BUFFER, FontVBO)
+
+	for _, c := range content {
+		glyph, ok := FontAtlas[c]
+		if !ok {
+			continue // skip missing characters
+		}
+
+		w := glyph.Size.X()
+		h := glyph.Size.Y()
+		xpos := x + glyph.Bearing.X()
+		ypos := y - (glyph.Size.Y() - glyph.Bearing.Y())
+
+		// Add z for layering
+		zpos := z
+
+		// Vertex format: x, y, z, u, v
+		vertices := []float32{
+			xpos, ypos + h, zpos, glyph.TexCoords[0], glyph.TexCoords[1],
+			xpos, ypos, zpos, glyph.TexCoords[0], glyph.TexCoords[3],
+			xpos + w, ypos, zpos, glyph.TexCoords[2], glyph.TexCoords[3],
+
+			xpos, ypos + h, zpos, glyph.TexCoords[0], glyph.TexCoords[1],
+			xpos + w, ypos, zpos, glyph.TexCoords[2], glyph.TexCoords[3],
+			xpos + w, ypos + h, zpos, glyph.TexCoords[2], glyph.TexCoords[1],
+		}
+
+		// Upload quad vertices
+		gl.BufferData(gl.ARRAY_BUFFER, len(vertices)*4, gl.Ptr(vertices), gl.DYNAMIC_DRAW)
+		gl.DrawArrays(gl.TRIANGLES, 0, 6)
+
+		// Advance cursor
+		x += glyph.Advance
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+}
