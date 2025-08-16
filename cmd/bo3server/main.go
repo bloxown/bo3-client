@@ -55,33 +55,51 @@ func main() {
 	datamodel.InitManager() // initializes datamodel.Manager (assumed global)
 	dm := datamodel.Manager // type inst.InstanceManager
 
+	// Create some stuff
+
+	test := datamodel.CreateInstance("Part", "baseplate")
+
+	if part, ok := test.(*inst.Part); ok {
+		log.Println(part.PrimitiveType) // Now it uses Part's method
+	} else {
+		log.Println("not a Part")
+	}
+	test.SetParent(datamodel.Manager.GetRoot().FindFirstChildOfClass("Workspace"))
+	datamodel.Manager.GetRoot().PrintHierarchy(2)
+
 	// Create network manager
 	nm := network.NewNetworkManager(1024)
 
-	connectionStatus := "Connecting..."
+	connectionStatus := "Being a server..."
 
 	use(connectionStatus) // cuz go is opinionated
 
-	// Example: if you're a client and want to handle server->client pong (PType=1, PSub=0x00)
-	nm.RegisterHandler(0x01, 0x00, func(dm inst.InstanceManager, payload []byte, c *network.ClientConn) {
-		log.Printf("Received pong from server: %q", string(payload))
-		connectionStatus = "Connected!"
+	// Register handlers (example: ping from client -> server PType=0, PSub=0x00)
+	nm.RegisterHandler(0x00, 0x00, func(dm inst.InstanceManager, payload []byte, c *network.ClientConn) {
+		log.Printf("Received ping payload=%q", string(payload))
+		// Example: server-side handler might mutate datamodel (but we will only call handlers on main thread)
+		c.SendPacket(0x01, 0x00, []byte("pong"))
+		//connectionStatus = "Connected!"
+	})
+	nm.RegisterHandler(0x00, 0x01, func(dm inst.InstanceManager, payload []byte, c *network.ClientConn) {
+		log.Printf("Received login payload=%q", string(payload))
+		c.SendPacket(0x01, 0x00, []byte("pong"))
+		// Send over stuff
+		for _, item := range dm.GetRoot().GetDescendants() {
+			c.SendPacket(0x01, 0x05, []byte("")) // 0x05 means: Add Item
+			// 0x06 means: Edit Item
+			// 0x07 means: Delete Item
+			// Anything Item has this format for payload, no spaces in here theyre only used for visibility
+			// : [item uuid, gotten by item.localId] 0x1D PROP 0x1E VALUE 0x1F PROP2 0x1E VALUE2
+		}
 	})
 
-	// Start connect as client
+	// start server:
 	go func() {
-		if err := nm.Connect("my-session-key", dm, "127.0.0.1", 3000); err != nil {
-			log.Printf("Connect error: %v", err)
-			connectionStatus = "Con error!"
+		if err := nm.Serve(dm, "0.0.0.0", 3000); err != nil {
+			log.Printf("Serve error: %v", err)
 		}
 	}()
-
-	// Or start server:
-	// go func() {
-	//     if err := nm.Serve(dm, "0.0.0.0", 3000); err != nil {
-	//         log.Printf("Serve error: %v", err)
-	//     }
-	// }()
 
 	// Prepare lua
 
@@ -112,6 +130,7 @@ func main() {
 		parts := dm.GetRoot().GetRenderables()
 		//log.Print(parts)
 		for _, part := range parts {
+			//log.Println(part.PrimitiveType)
 			rend.PushPrimitiveBlock(
 				part.Position,
 				part.Size,
@@ -173,6 +192,7 @@ func main() {
 			}
 		}
 	afterNetwork:
+		// Push to client
 	}
 	// Destroy renderer first
 }

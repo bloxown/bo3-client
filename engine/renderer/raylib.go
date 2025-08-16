@@ -90,6 +90,14 @@ func (r *Renderer) PushUIText(pos mgl32.Vec3, color mgl32.Vec4, content string) 
 		Type:     "text",
 	})
 }
+func (r *Renderer) PushDUIText(pos mgl32.Vec3, color mgl32.Vec4, content string) {
+	r.uiqueue = append(r.uiqueue, UIElement{
+		Position: pos,
+		Color:    color,
+		Content:  content,
+		Type:     "debugtext",
+	})
+}
 
 // AddLight adds a light to the scene
 func (r *Renderer) AddLight(pos, color mgl32.Vec3, intensity float32, lightType int) {
@@ -155,7 +163,7 @@ func (r *Renderer) EndFrame(rlCam rl.Camera) {
 	rl.SetShaderValue(r.shader, rl.GetShaderLocation(r.shader, "lightCount"), lightCountSlice, rl.ShaderUniformInt)
 
 	// Pass light data (up to 8 lights for performance)
-	maxLights := 8
+	maxLights := 16384
 	if len(r.lights) > maxLights {
 		r.lights = r.lights[:maxLights]
 	}
@@ -209,7 +217,7 @@ func (r *Renderer) EndFrame(rlCam rl.Camera) {
 	// Render UI elements (no lighting needed)
 	for _, ui := range r.uiqueue {
 		switch ui.Type {
-		case "text":
+		case "debugtext": // Caused by DUI
 			rl.DrawText(ui.Content, int32(ui.Position.X()), int32(ui.Position.Y()), 20, vec4ToColor(ui.Color))
 		}
 	}

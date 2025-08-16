@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Compiled bo3 client and server
+/bo3client
+/bo3server
+
 # Test binary, built with `go test -c`
 *.test
 
